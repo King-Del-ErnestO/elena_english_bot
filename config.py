@@ -7,7 +7,7 @@ _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
 load_dotenv(_here.parent / ".env")
 
-TELEGRAM_TOKEN = "7887005250:AAGxQec_EDAFD7hGQP3PVnd9W4fj-kdFIS4"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7887005250:AAGxQec_EDAFD7hGQP3PVnd9W4fj-kdFIS4")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # Cheaper model for better pricing control
 MONGO_URI = os.getenv("MONGO_URI")
