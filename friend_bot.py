@@ -8,7 +8,15 @@ import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from collections import defaultdict, deque
 from typing import List, Dict, Deque, Tuple, Optional, Set
-from config import TELEGRAM_TOKEN, OPENAI_API_KEY, OPENAI_MODEL, DAILY_MESSAGE_LIMIT, ADMIN_TELEGRAM_IDS
+from config import (
+    TELEGRAM_TOKEN,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    DAILY_MESSAGE_LIMIT,
+    ADMIN_TELEGRAM_IDS,
+    PRICE_INPUT_PER_1M,
+    PRICE_OUTPUT_PER_1M,
+)
 import sqlite3
 import threading
 import time
@@ -70,6 +78,18 @@ def init_db():
             PRIMARY KEY (chat_id, date)
         )
     """)
+    # chat_id 0 = shared/system usage (e.g. word-of-the-day generation)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_usage (
+            chat_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            request_count INTEGER DEFAULT 0,
+            PRIMARY KEY (chat_id, date)
+        )
+    """)
     
     # Migrate existing databases: add missing columns if they don't exist
     for column_sql in (
@@ -83,6 +103,135 @@ def init_db():
     
     conn.commit()
     conn.close()
+
+# Shared / system usage bucket (word of the day, etc.)
+SYSTEM_CHAT_ID = 0
+
+def estimate_cost_usd(prompt_tokens: int, completion_tokens: int) -> float:
+    """Approximate USD cost for gpt-3.5-turbo from token counts."""
+    return (
+        (prompt_tokens / 1_000_000) * PRICE_INPUT_PER_1M
+        + (completion_tokens / 1_000_000) * PRICE_OUTPUT_PER_1M
+    )
+
+def format_usd(amount: float) -> str:
+    if amount < 0.01:
+        return f"${amount:.4f}"
+    return f"${amount:.2f}"
+
+def record_token_usage(chat_id: int, resp) -> None:
+    """Persist prompt/completion tokens from an OpenAI chat completion response."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return
+    prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion = int(getattr(usage, "completion_tokens", 0) or 0)
+    total = int(getattr(usage, "total_tokens", 0) or (prompt + completion))
+    if prompt == 0 and completion == 0 and total == 0:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO token_usage (chat_id, date, prompt_tokens, completion_tokens, total_tokens, request_count)
+        VALUES (?, ?, ?, ?, ?, 1)
+        ON CONFLICT(chat_id, date) DO UPDATE SET
+            prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+            completion_tokens = completion_tokens + excluded.completion_tokens,
+            total_tokens = total_tokens + excluded.total_tokens,
+            request_count = request_count + 1
+    """, (chat_id, today, prompt, completion, total))
+    conn.commit()
+    conn.close()
+
+def get_usage_totals(days: Optional[int] = None) -> dict:
+    """
+    Aggregate token usage.
+    days=None → all time; days=1 → today; days=N → last N days inclusive.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if days is None:
+        cursor.execute("""
+            SELECT COALESCE(SUM(prompt_tokens), 0),
+                   COALESCE(SUM(completion_tokens), 0),
+                   COALESCE(SUM(total_tokens), 0),
+                   COALESCE(SUM(request_count), 0)
+            FROM token_usage
+        """)
+    else:
+        since = (datetime.now() - timedelta(days=max(days - 1, 0))).strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT COALESCE(SUM(prompt_tokens), 0),
+                   COALESCE(SUM(completion_tokens), 0),
+                   COALESCE(SUM(total_tokens), 0),
+                   COALESCE(SUM(request_count), 0)
+            FROM token_usage
+            WHERE date >= ?
+        """, (since,))
+    row = cursor.fetchone()
+    conn.close()
+    prompt, completion, total, requests = row
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "request_count": requests,
+        "cost_usd": estimate_cost_usd(prompt, completion),
+    }
+
+def get_usage_by_user(days: Optional[int] = None, limit: int = 20) -> List[dict]:
+    """Per-user usage rows, highest spend first."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if days is None:
+        cursor.execute("""
+            SELECT t.chat_id,
+                   COALESCE(SUM(t.prompt_tokens), 0),
+                   COALESCE(SUM(t.completion_tokens), 0),
+                   COALESCE(SUM(t.total_tokens), 0),
+                   COALESCE(SUM(t.request_count), 0),
+                   u.email, u.username, u.first_name
+            FROM token_usage t
+            LEFT JOIN users u ON u.chat_id = t.chat_id
+            GROUP BY t.chat_id
+            ORDER BY SUM(t.total_tokens) DESC
+            LIMIT ?
+        """, (limit,))
+    else:
+        since = (datetime.now() - timedelta(days=max(days - 1, 0))).strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT t.chat_id,
+                   COALESCE(SUM(t.prompt_tokens), 0),
+                   COALESCE(SUM(t.completion_tokens), 0),
+                   COALESCE(SUM(t.total_tokens), 0),
+                   COALESCE(SUM(t.request_count), 0),
+                   u.email, u.username, u.first_name
+            FROM token_usage t
+            LEFT JOIN users u ON u.chat_id = t.chat_id
+            WHERE t.date >= ?
+            GROUP BY t.chat_id
+            ORDER BY SUM(t.total_tokens) DESC
+            LIMIT ?
+        """, (since, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    results = []
+    for chat_id, prompt, completion, total, requests, email, username, first_name in rows:
+        label = "system (shared)" if chat_id == SYSTEM_CHAT_ID else (
+            email or (f"@{username}" if username else None) or first_name or str(chat_id)
+        )
+        results.append({
+            "chat_id": chat_id,
+            "label": label,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "request_count": requests,
+            "cost_usd": estimate_cost_usd(prompt, completion),
+        })
+    return results
 
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
@@ -312,6 +461,7 @@ def get_today_word():
                     ],
                     response_format={"type": "json_object"}
                 )
+                record_token_usage(SYSTEM_CHAT_ID, resp)
                 candidate_word = json.loads(resp.choices[0].message.content.strip())
                 
                 # Check if the word was already used
@@ -485,7 +635,8 @@ def _main_keyboard() -> ReplyKeyboardMarkup:
 def _admin_keyboard() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("➕ Add email"), KeyboardButton("➖ Remove email"))
-    kb.add(KeyboardButton("📋 List emails"), KeyboardButton("✅ Done"))
+    kb.add(KeyboardButton("📋 List emails"), KeyboardButton("📊 Usage stats"))
+    kb.add(KeyboardButton("✅ Done"))
     return kb
 
 def _welcome_message(chat_id: int):
@@ -590,7 +741,7 @@ Rules:
 Return in simple, readable bullet points.
 """
 
-def _chat_response(context: List[Dict[str, str]]) -> str:
+def _chat_response(context: List[Dict[str, str]], chat_id: int = SYSTEM_CHAT_ID) -> str:
     """Call OpenAI for a friendly chat response."""
     if client is None:
         return "Hi! (OpenAI SDK not installed). Tell me about your day 😊"
@@ -600,9 +751,10 @@ def _chat_response(context: List[Dict[str, str]]) -> str:
         max_tokens=180,
         messages=context
     )
+    record_token_usage(chat_id, resp)
     return resp.choices[0].message.content.strip()
 
-def _correction_response(last_two_user_msgs: List[str]) -> str:
+def _correction_response(last_two_user_msgs: List[str], chat_id: int = SYSTEM_CHAT_ID) -> str:
     """Call OpenAI to produce gentle corrections for the last two messages."""
     if client is None:
         return "Всё отлично! Продолжай в том же духе—у тебя получается! 🌟"
@@ -617,6 +769,7 @@ def _correction_response(last_two_user_msgs: List[str]) -> str:
         max_tokens=220,
         messages=msgs
     )
+    record_token_usage(chat_id, resp)
     return resp.choices[0].message.content.strip()
 
 def _build_context(chat_id: int, user_msg: str) -> List[Dict[str, str]]:
@@ -666,7 +819,8 @@ def handle_admin(message):
         "Выбери действие или отправь:\n"
         "• <code>/addemail name@example.com</code>\n"
         "• <code>/removeemail name@example.com</code>\n"
-        "• <code>/listemails</code>",
+        "• <code>/listemails</code>\n"
+        "• <code>/usage</code>",
         reply_markup=_admin_keyboard(),
     )
 
@@ -712,6 +866,15 @@ def handle_listemails_cmd(message):
     _admin_list_emails(chat_id)
 
 
+@bot.message_handler(commands=["usage"])
+def handle_usage_cmd(message):
+    chat_id = message.chat.id
+    if not is_admin(chat_id):
+        bot.send_message(chat_id, "Эта команда доступна только администраторам.")
+        return
+    _admin_usage_stats(chat_id)
+
+
 def _admin_add_email(chat_id: int, raw_email: str):
     email = normalize_email(raw_email)
     if not is_valid_email(email):
@@ -742,6 +905,50 @@ def _admin_list_emails(chat_id: int):
     bot.send_message(chat_id, f"<b>Allowed emails ({len(emails)})</b>\n\n{lines}", reply_markup=_admin_keyboard())
 
 
+def _format_usage_block(title: str, totals: dict) -> str:
+    return (
+        f"<b>{title}</b>\n"
+        f"• Requests: {totals['request_count']}\n"
+        f"• Prompt tokens: {totals['prompt_tokens']:,}\n"
+        f"• Completion tokens: {totals['completion_tokens']:,}\n"
+        f"• Total tokens: {totals['total_tokens']:,}\n"
+        f"• Approx cost: <b>{format_usd(totals['cost_usd'])}</b>"
+    )
+
+
+def _admin_usage_stats(chat_id: int):
+    today = get_usage_totals(days=1)
+    week = get_usage_totals(days=7)
+    all_time = get_usage_totals(days=None)
+    per_user = get_usage_by_user(days=None, limit=15)
+
+    lines = [
+        f"<b>📊 Token usage</b> ({OPENAI_MODEL})",
+        f"<i>Pricing used: ${PRICE_INPUT_PER_1M}/1M input · ${PRICE_OUTPUT_PER_1M}/1M output</i>",
+        "",
+        _format_usage_block("Today", today),
+        "",
+        _format_usage_block("Last 7 days", week),
+        "",
+        _format_usage_block("All time", all_time),
+    ]
+
+    if per_user:
+        lines.append("")
+        lines.append("<b>Top users (all time)</b>")
+        for i, u in enumerate(per_user, 1):
+            lines.append(
+                f"{i}. <code>{u['label']}</code> — "
+                f"{u['total_tokens']:,} tok · {format_usd(u['cost_usd'])} "
+                f"({u['request_count']} req)"
+            )
+    else:
+        lines.append("")
+        lines.append("No usage recorded yet.")
+
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=_admin_keyboard())
+
+
 @bot.message_handler(func=lambda m: True)
 def handle_chat(message):
     chat_id = message.chat.id
@@ -759,6 +966,9 @@ def handle_chat(message):
             return
         if text == "📋 List emails":
             _admin_list_emails(chat_id)
+            return
+        if text == "📊 Usage stats":
+            _admin_usage_stats(chat_id)
             return
         if text == "✅ Done":
             admin_pending_action.pop(chat_id, None)
@@ -815,7 +1025,7 @@ def handle_chat(message):
 
     # Build and send friendly reply
     context = _build_context(chat_id, text)
-    reply = _chat_response(context)
+    reply = _chat_response(context, chat_id=chat_id)
     bot.send_message(chat_id, reply)
     recent_dialogue[chat_id].append(("user", text))
     recent_dialogue[chat_id].append(("bot", reply))
@@ -823,7 +1033,7 @@ def handle_chat(message):
     # Every 2 interactions → send gentle corrections
     if user_turn_count[chat_id] % 3 == 0:
         last_two = list(recent_user_msgs[chat_id])
-        correction = _correction_response(last_two)
+        correction = _correction_response(last_two, chat_id=chat_id)
         # Prefix to make it feel like a separate aside
         bot.send_message(chat_id, f"<b>Быстрые советы 🎯</b>\n{correction}")
 

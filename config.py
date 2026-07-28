@@ -12,6 +12,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # Cheaper model for better pricing control
 MONGO_URI = os.getenv("MONGO_URI")
 
+# gpt-3.5-turbo approximate API pricing (USD per 1M tokens)
+PRICE_INPUT_PER_1M = 0.50
+PRICE_OUTPUT_PER_1M = 1.50
+
 # Comma-separated Telegram user IDs allowed to use /admin
 ADMIN_TELEGRAM_IDS = {
     int(x.strip())
