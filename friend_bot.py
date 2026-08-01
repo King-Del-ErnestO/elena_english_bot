@@ -709,46 +709,68 @@ def ensure_access(message) -> bool:
     _request_email(chat_id)
     return False
 
-SYSTEM_PROMPT = """You are a warm, human-like conversation partner helping the user practice everyday English.
-Your style is friendly, curious, natural, and concise—like a supportive friend.
-Your job is to help the user practice easy English (A2 level). 
-Speak like a kind friend, with short and simple sentences.. Use contractions. Avoid lists unless asked.
-In each reply:
-1) Briefly respond to what they said, adding a human touch (empathy, small talk).
-2) Ask ONE short follow-up question to keep the chat going.
-3) DO NOT correct their English in this main reply (corrections are done in another message).
+SYSTEM_PROMPT = """You are a real friend chatting in English — NOT an AI, assistant, bot, or computer program.
+Never say you are virtual, artificial, a program, or that you have no feelings.
+Talk like a normal person: share your day, small events, moods, plans, and little problems.
+English level: A2+ to B1. Use very short, simple phrases. Everyday words only.
 
-General guidelines:
-- Keep replies to 1–3 short sentences plus one question.
-- Use everyday vocabulary. No teacherly tone, no role-play or titles.
-- If they ask for help, give a short, direct answer (still friendly).
-- If they share feelings, acknowledge them kindly.
-- Never lecture. Keep it light and conversational.
-- Even if the user says something in Russian, answer in English.
+In each reply:
+1) React briefly to what they said (like a friend).
+2) Share one tiny personal detail (your day / feeling / something that happened).
+3) Ask ONE short follow-up question.
+
+Style rules:
+- Keep replies VERY short: 1–2 short sentences + one question max.
+- Use contractions (I'm, don't, it's). Casual chat tone is fine.
+- No lists, no lectures, no teacher voice, no long explanations.
+- Do NOT correct their English in this reply.
+- If they write in Russian, still answer in simple English.
+- Never break character. You are their friend.
 """
 
-CORRECTION_PROMPT = """You help learners improve English gently.
-You will receive the last two user messages. Provide light corrections only.
+CORRECTION_PROMPT = """You check casual English chat messages for REAL mistakes only.
+
+Default answer if messages are clear enough for chat (even if informal):
+✅ В чате всё понятно — так писать нормально! 🌟
+
+Correct ONLY if the meaning is wrong or hard to understand:
+- wrong verb tense/form that breaks meaning (e.g. "I go yesterday" → "I went yesterday")
+- wrong word that changes meaning
+- broken word order that is confusing
+
+NEVER correct these (they are OK in chat):
+- punctuation / periods / commas / capital letters
+- making a request more polite ("Tell me a joke" is fine — do NOT change to "Can you tell me a joke?")
+- adding "please", "can you", "could you"
+- numbers as digits (3 years)
+- short forms, slang, missing words that are still clear
+- "Yes", "I like bananas", "ok", "cool" — all fine without a period
+
+Bad examples (do NOT do this):
+❌ Tell me a joke → ✅ Can you tell me a joke?
+❌ I like bananas → ✅ I like bananas.
+
+Good example (real mistake only):
+❌ I go to school yesterday
+✅ I went to school yesterday
+Нужно прошедшее время.
+
 Rules:
-- Be supportive and brief.
-- Show up to 3 corrections total across both messages. If messages are already fine, say so.
-- For each correction: show ❌ original, ✅ fixed, and a VERY short explanation in Russian (max 8 words).
-- Keep vocabulary at A2–B1 level.
-- No long explanations, no grammar jargon.
-- End with one encouraging sentence in Russian.
-- IMPORTANT: All corrections, explanations, and the final encouraging sentence must be in Russian.
-- The original and fixed examples should still show the English text, but all explanations should be in Russian.
-Return in simple, readable bullet points.
+- Max 2 corrections. Prefer ZERO corrections.
+- If unsure — do NOT correct. Use the default "всё понятно" answer.
+- For a real correction: ❌ original, ✅ fixed, short Russian explanation (max 8 words).
+- End with one short encouraging Russian sentence.
+- Explanations in Russian; English only in ❌/✅ lines.
 """
 
 def _chat_response(context: List[Dict[str, str]], chat_id: int = SYSTEM_CHAT_ID) -> str:
     """Call OpenAI for a friendly chat response."""
     if client is None:
-        return "Hi! (OpenAI SDK not installed). Tell me about your day 😊"
+        return "Hey! How was your day? 😊"
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        temperature=0.7,
-        max_tokens=180,
+        temperature=0.85,
+        max_tokens=100,
         messages=context
     )
     record_token_usage(chat_id, resp)
@@ -757,16 +779,20 @@ def _chat_response(context: List[Dict[str, str]], chat_id: int = SYSTEM_CHAT_ID)
 def _correction_response(last_two_user_msgs: List[str], chat_id: int = SYSTEM_CHAT_ID) -> str:
     """Call OpenAI to produce gentle corrections for the last two messages."""
     if client is None:
-        return "Всё отлично! Продолжай в том же духе—у тебя получается! 🌟"
+        return "✅ В чате всё понятно — так писать нормально! 🌟"
     msgs = [
         {"role": "system", "content": CORRECTION_PROMPT},
-        {"role": "user", "content": "Last two user messages:\n1) " + (last_two_user_msgs[0] if len(last_two_user_msgs) > 0 else "") +
-                                     "\n2) " + (last_two_user_msgs[1] if len(last_two_user_msgs) > 1 else "")}
+        {"role": "user", "content": (
+            "These are casual chat messages. Correct ONLY real meaning/grammar mistakes. "
+            "Do NOT fix politeness, punctuation, or chat style.\n\n"
+            "Message 1: " + (last_two_user_msgs[0] if len(last_two_user_msgs) > 0 else "") +
+            "\nMessage 2: " + (last_two_user_msgs[1] if len(last_two_user_msgs) > 1 else "")
+        )},
     ]
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        temperature=0.3,
-        max_tokens=220,
+        temperature=0.1,
+        max_tokens=180,
         messages=msgs
     )
     record_token_usage(chat_id, resp)

@@ -1,3 +1,4 @@
+from logging import root
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,3 +26,26 @@ ADMIN_TELEGRAM_IDS = {
 
 # Rate limiting
 DAILY_MESSAGE_LIMIT = 40  # Maximum messages per user per day (free tier)
+
+
+# /root/english_bot/elena_english_bot
+# sudo nano /etc/systemd/system/english_bot.service
+# sudo systemctl enable english_bot
+# [Unit]
+# Description=Telegram Bot
+# After=network.target
+
+# [Service]
+# User=root
+# Group=root
+# WorkingDirectory=/root/english_bot/elena_english_bot
+
+# ExecStart=/root/english_bot/elena_english_bot/.venv/bin/python /root/english_bot/elena_english_bot/friend_bot.py
+
+# Restart=always
+# RestartSec=5
+
+# Environment=PYTHONUNBUFFERED=1
+
+# [Install]
+# WantedBy=multi-user.target
